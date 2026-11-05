@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Answers by student</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="host">
+<div class="wrap" style="max-width: 1100px">
+  <h1 style="font-size: 2rem; margin: 0 0 0.3rem">Answers by student</h1>
+  <p class="sub muted" id="summary" style="margin: 0 0 1.2rem">Loading…</p>
+  <p class="notice" id="problem" hidden></p>
+  <div id="main" hidden>
+    <div class="toolbar">
+      <input type="search" id="filter" placeholder="Find a student" aria-label="Find a student">
+      <button type="button" class="secondary" id="csv">Download results (CSV)</button>
+      <span class="lost" id="lost" hidden></span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead id="head"></thead>
+        <tbody id="body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<script src="config.js"></script>
+<script src="supabase.js"></script>
+<script src="common.js"></script>
+<script>
+(function () {
+  var C = QZ.config, esc = QZ.esc;
+  var $ = function (id) { return document.getElementById(id); };
+  var Q = [], rows = [], session = null;
+
+  function problem(msg, html) { $("summary").hidden = true; $("problem")[html ? "innerHTML" : "textContent"] = msg; $("problem").hidden = false; }
+  var bad = QZ.configProblem();
+  if (bad) { problem(bad); return; }
+  var db = QZ.client(true);
+
+  db.auth.getSession().then(function (res) {
+    if (!res.data || !res.data.session) { problem('Sign in on the <a href="instructor.html">instructor screen</a> first, then reload this page.', true); return; }
+    return db.rpc("quiz_is_admin").then(function (r) {
+      if (r.error) throw r.error;
+      if (!r.data) { problem("This account isn’t set as the instructor."); return; }
+      return db.from("quiz_questions").select("position,answer").eq("quiz_id", C.quizId).order("position").then(function (q) {
+        if (q.error) throw q.error;
+        Q = q.data;
+        var h = "<tr><th>Name</th><th>Submitted</th>";
+        Q.forEach(function (_, i) { h += '<th class="q">Q' + (i + 1) + "</th>"; });
+        $("head").innerHTML = h + '<th class="s">Score</th></tr>';
+        $("main").hidden = false;
+        poll(); setInterval(poll, 4000);
+      });
+    });
+  }).catch(function () { problem(QZ.reachMsg); });
+
+  function render() {
+    var NQ = Q.length, f = $("filter").value.trim().toLowerCase();
+    var shown = rows.filter(function (r) { return !f || r.name.toLowerCase().indexOf(f) !== -1; });
+    var dups = rows.some(function (r) { return r.same_name > 1; });
+    $("summary").textContent = rows.length + (rows.length === 1 ? " student has" : " students have") +
+      " submitted in this class." + (dups ? " Some names were used on more than one phone; they are marked in red." : "");
+    if (!shown.length) {
+      $("body").innerHTML = '<tr><td class="empty" colspan="' + (NQ + 3) + '">' +
+        (rows.length ? "No student matches that name." : "No answers yet. This page updates by itself.") + "</td></tr>";
+      return;
+    }
+    $("body").innerHTML = shown.map(function (r) {
+      var cells = r.answers.map(function (a, i) {
+        return '<td class="q ' + (r.correct[i] ? "right" : "wrong") + '">' + a + (r.correct[i] ? " ✓" : " ✗") + "</td>";
+      }).join("");
+      var flag = r.same_name > 1 ? '<span class="flag">Same name on ' + r.same_name + " phones</span>" : "";
+      return '<tr class="' + (r.same_name > 1 ? "dup" : "") + '"><td class="n">' + esc(r.name) + flag + "</td><td>" +
+        esc(r.submitted) + "</td>" + cells + '<td class="s"><strong>' + r.score + "</strong> / " + NQ + "</td></tr>";
+    }).join("");
+  }
+
+  function poll() {
+    db.from("quiz_quizzes").select("session_id").eq("quiz_id", C.quizId).single().then(function (r) {
+      if (r.error) throw r.error;
+      session = r.data.session_id;
+      return db.from("quiz_responses").select("name,answers,score,created_at").eq("session_id", session);
+    }).then(function (r) {
+      if (r.error) throw r.error;
+      $("lost").hidden = true;
+      rows = QZ.studentRows(Q, r.data); render();
+    }).catch(function () { $("lost").textContent = QZ.reachMsg; $("lost").hidden = false; });
+  }
+
+  $("filter").addEventListener("input", render);
+  $("csv").addEventListener("click", function () { QZ.csv(Q, rows); });
+})();
+</script>
+</body>
+</html>

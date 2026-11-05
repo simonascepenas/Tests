@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Quiz</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="student">
+<main>
+  <p class="sub">International Conflicts and Strategy</p>
+  <h1 id="title">Loading the quiz…</h1>
+  <p class="intro" id="intro" hidden></p>
+  <p class="notice" id="problem" hidden></p>
+
+  <section class="result" id="result" tabindex="-1" hidden>
+    <div><span class="big" id="score">0</span><span class="of" id="outof"></span></div>
+    <p id="resultMsg"></p>
+  </section>
+
+  <form id="form" novalidate hidden>
+    <div>
+      <label class="name" for="name">Your full name</label>
+      <p class="hint" id="namehint">First and last name, so your instructor can match your answers to you.</p>
+      <input type="text" id="name" name="name" autocomplete="name" maxlength="60" required aria-describedby="namehint">
+    </div>
+    <div id="qs"></div>
+    <div class="actions">
+      <button type="submit" id="submit">Submit answers</button>
+      <p class="status" id="status" aria-live="polite"></p>
+    </div>
+  </form>
+</main>
+<script src="config.js"></script>
+<script src="supabase.js"></script>
+<script src="common.js"></script>
+<script>
+(function () {
+  var C = QZ.config, L = QZ.letters, esc = QZ.esc, store = QZ.store;
+  var $ = function (id) { return document.getElementById(id); };
+  var form = $("form"), status = $("status"), btn = $("submit"), nameEl = $("name");
+  var Q = [], SESSION = null, RKEY = null;
+
+  function problem(msg) { $("problem").textContent = msg; $("problem").hidden = false; }
+
+  var bad = QZ.configProblem();
+  if (bad) { $("title").textContent = "Quiz not ready"; problem(bad); return; }
+  var db = QZ.client(false);
+
+  var cid = store.get("qz_client");
+  if (!cid) { cid = Date.now().toString(36) + Math.random().toString(36).slice(2, 12); store.set("qz_client", cid); }
+  var savedName = store.get("qz_name"); if (savedName) nameEl.value = savedName;
+
+  function render() {
+    $("qs").innerHTML = Q.map(function (item, qi) {
+      var opts = item.options.map(function (o, oi) {
+        return '<label class="opt" data-o="' + oi + '"><input type="radio" name="q' + qi + '" value="' + oi + '">' +
+          '<span class="letter">' + L[oi] + '</span><span class="txt">' + esc(o) + '</span><span class="tag"></span></label>';
+      }).join("");
+      return '<fieldset id="q' + (qi + 1) + '"><legend><span class="qn">' + (qi + 1) + '.</span>' + esc(item.q) + '</legend>' +
+        '<div class="options">' + opts + '</div><div class="why"></div></fieldset>';
+    }).join("");
+    $("outof").textContent = "out of " + Q.length;
+  }
+
+  function chosen() {
+    return Q.map(function (_, qi) {
+      var el = form.querySelector('input[name="q' + qi + '"]:checked');
+      return el ? Number(el.value) : null;
+    });
+  }
+
+  function showResult(r, already) {
+    nameEl.value = r.name; nameEl.disabled = true;
+    r.results.forEach(function (res, qi) {
+      var fs = $("q" + (qi + 1));
+      if (!fs) return;
+      fs.classList.add("done");
+      fs.querySelectorAll("input").forEach(function (inp) { inp.disabled = true; inp.checked = Number(inp.value) === res.chosen; });
+      fs.querySelectorAll(".opt").forEach(function (lab) {
+        var oi = Number(lab.getAttribute("data-o")), tag = lab.querySelector(".tag");
+        if (oi === res.answer) { lab.classList.add("right"); tag.textContent = oi === res.chosen ? "Your answer" : "Correct answer"; }
+        else if (oi === res.chosen) { lab.classList.add("wrong"); tag.textContent = "Your answer"; }
+      });
+      var why = fs.querySelector(".why");
+      why.className = "why " + (res.correct ? "ok" : "bad");
+      why.innerHTML = "<strong>" + (res.correct ? "Right." : "Not quite.") + "</strong>" + esc(res.why);
+    });
+    $("score").textContent = r.score;
+    $("resultMsg").textContent = already
+      ? "You’ve already submitted this quiz. Here is your result."
+      : "Submitted. Read the explanations below each question.";
+    $("intro").hidden = true;
+    form.hidden = false;
+    btn.parentNode.hidden = true;
+    var box = $("result"); box.hidden = false;
+    box.scrollIntoView({ block: "start" }); box.focus({ preventScroll: true });
+  }
+
+  db.rpc("quiz_get", { p_quiz: C.quizId }).then(function (res) {
+    if (res.error) throw res.error;
+    var quiz = res.data;
+    if (!quiz) { $("title").textContent = "Quiz not found"; problem("No quiz called “" + C.quizId + "” exists. Check quizId in config.js and that setup.sql has been run."); return; }
+    Q = quiz.questions; SESSION = quiz.session; RKEY = "qz_result_" + SESSION;
+    document.title = quiz.title;
+    $("title").textContent = quiz.title;
+    $("intro").textContent = (quiz.subtitle ? quiz.subtitle + ". " : "") + "Enter your full name, answer all " + Q.length + " questions, and submit. You’ll see your result right away.";
+    $("intro").hidden = false;
+    render();
+    var saved = store.get(RKEY);
+    if (saved) { try { showResult(JSON.parse(saved), true); return; } catch (e) {} }
+    if (!quiz.open) { $("intro").hidden = true; problem("This quiz is closed. Ask your instructor if you think it should be open."); return; }
+    form.hidden = false;
+  }).catch(function () {
+    $("title").textContent = "Couldn’t load the quiz";
+    problem("Check that your phone has internet, then reload this page.");
+  });
+
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var name = nameEl.value.trim().replace(/\s+/g, " ");
+    var a = chosen();
+    var missing = a.filter(function (x) { return x === null; }).length;
+    status.className = "status warn";
+    if (!name) { status.textContent = "Enter your full name first."; nameEl.focus(); return; }
+    if (name.split(" ").length < 2) { status.textContent = "Enter your first and last name."; nameEl.focus(); return; }
+    if (missing) {
+      status.textContent = "Answer the remaining " + missing + (missing === 1 ? " question." : " questions.");
+      $("q" + (a.indexOf(null) + 1)).scrollIntoView({ block: "start" });
+      return;
+    }
+    status.className = "status"; status.textContent = "Sending…"; btn.disabled = true;
+    store.set("qz_name", name);
+    db.rpc("quiz_submit", { p_quiz: C.quizId, p_session: SESSION, p_client: cid, p_name: name, p_answers: a })
+      .then(function (res) {
+        if (res.error) throw res.error;
+        var r = res.data;
+        if (r.error === "stale") { location.reload(); return; }
+        if (r.error) {
+          btn.disabled = false; status.className = "status warn";
+          status.textContent = r.error === "closed" ? "The instructor has closed this quiz, so new answers can’t be saved."
+            : r.error === "full" ? "This quiz has reached its response limit. Tell your instructor."
+            : "Check your name (first and last) and that every question has an answer, then submit again.";
+          return;
+        }
+        store.set(RKEY, JSON.stringify(r));
+        status.textContent = "";
+        showResult(r, r.already);
+      })
+      .catch(function () {
+        btn.disabled = false; status.className = "status warn";
+        status.textContent = "Couldn’t send your answers. Check that your phone has internet, then tap Submit again.";
+      });
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Instructor screen</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="host">
+
+<section class="signin" id="signin" hidden>
+  <h1>Instructor sign-in</h1>
+  <p class="muted">Use the instructor account you created in Supabase.</p>
+  <form id="signinForm">
+    <label for="email">Email</label>
+    <input type="email" id="email" autocomplete="username" required>
+    <label for="password">Password</label>
+    <input type="password" id="password" autocomplete="current-password" required>
+    <button type="submit" id="signinBtn">Sign in</button>
+    <p class="status" id="signinStatus" aria-live="polite"></p>
+  </form>
+</section>
+
+<div class="signin" id="fatal" hidden>
+  <h1>Quiz not ready</h1>
+  <p class="notice" id="fatalMsg"></p>
+  <p><button type="button" class="secondary" id="fatalSignout" hidden>Sign out</button></p>
+</div>
+
+<div class="wrap" id="app" hidden>
+  <header>
+    <div>
+      <h1 id="title"></h1>
+      <p class="sub" id="subtitle"></p>
+    </div>
+    <div class="controls">
+      <button type="button" id="reveal">Show answers</button>
+      <a href="students.html" target="_blank" rel="noopener">See answers by student</a>
+      <button type="button" class="secondary" id="csv">Download results (CSV)</button>
+      <button type="button" class="secondary" id="openToggle">Close quiz</button>
+      <button type="button" class="secondary" id="reset">Reset for a new class</button>
+      <button type="button" class="secondary" id="signout">Sign out</button>
+    </div>
+  </header>
+  <p class="notice" id="fileWarn" hidden>This page is open from a file on your computer, so the QR code won’t work for students. Open it from your GitHub Pages address instead.</p>
+  <div class="grid">
+    <section class="join">
+      <h2>Scan to answer</h2>
+      <div class="qr" id="qr" role="img" aria-label="QR code for the quiz"></div>
+      <p class="url" id="url"></p>
+      <p class="mode">Works on any connection, including mobile data.</p>
+      <div class="count"><span class="n" id="n">0</span><span class="lbl" id="nlbl">responses</span></div>
+      <p class="avg" id="avg" hidden></p>
+      <p class="notice closed" id="closedNote" hidden>Quiz closed. New answers are blocked.</p>
+      <p class="lost" id="lost" hidden></p>
+    </section>
+    <section id="results"></section>
+  </div>
+</div>
+
+<script src="config.js"></script>
+<script src="supabase.js"></script>
+<script src="common.js"></script>
+<script src="qrcode.js"></script>
+<script>
+(function () {
+  var C = QZ.config, L = QZ.letters, esc = QZ.esc;
+  var $ = function (id) { return document.getElementById(id); };
+  var quiz = null, Q = [], responses = [], revealed = false, timer = null;
+
+  function fatal(msg, canSignOut) {
+    $("app").hidden = true; $("signin").hidden = true;
+    $("fatalMsg").textContent = msg; $("fatal").hidden = false;
+    $("fatalSignout").hidden = !canSignOut;
+  }
+  var bad = QZ.configProblem();
+  if (bad) { fatal(bad); return; }
+  var db = QZ.client(true);
+
+  function signOut() { if (timer) clearInterval(timer); db.auth.signOut().then(function () { location.reload(); }); }
+  $("signout").addEventListener("click", signOut);
+  $("fatalSignout").addEventListener("click", signOut);
+
+  $("signinForm").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var st = $("signinStatus"); st.className = "status"; st.textContent = "Signing in…"; $("signinBtn").disabled = true;
+    db.auth.signInWithPassword({ email: $("email").value.trim(), password: $("password").value }).then(function (res) {
+      $("signinBtn").disabled = false;
+      if (res.error) {
+        st.className = "status warn";
+        st.textContent = /invalid/i.test(res.error.message) ? "Wrong email or password." : res.error.message;
+        return;
+      }
+      st.textContent = ""; start();
+    }).catch(function () { $("signinBtn").disabled = false; st.className = "status warn"; st.textContent = QZ.reachMsg; });
+  });
+
+  db.auth.getSession().then(function (res) {
+    if (res.data && res.data.session) start(); else $("signin").hidden = false;
+  });
+
+  function start() {
+    $("signin").hidden = true;
+    db.rpc("quiz_is_admin").then(function (res) {
+      if (res.error) throw res.error;
+      if (!res.data) { fatal("This account isn’t set as the instructor. In setup.sql, put this email in step 1 and run the file again in the Supabase SQL Editor.", true); return; }
+      return loadQuiz().then(function () {
+        $("app").hidden = false;
+        drawQR(); renderQuestions(); poll();
+        timer = setInterval(poll, 3000);
+      });
+    }).catch(function () { fatal(QZ.reachMsg, true); });
+  }
+
+  function loadQuiz() {
+    return Promise.all([
+      db.from("quiz_quizzes").select("*").eq("quiz_id", C.quizId).maybeSingle(),
+      db.from("quiz_questions").select("position,question,options,answer").eq("quiz_id", C.quizId).order("position")
+    ]).then(function (r) {
+      if (r[0].error || r[1].error) throw r[0].error || r[1].error;
+      if (!r[0].data) throw new Error("missing");
+      quiz = r[0].data;
+      Q = r[1].data.map(function (x) { return { q: x.question, options: x.options, answer: x.answer }; });
+      document.title = quiz.title + ": instructor screen";
+      $("title").textContent = quiz.title; $("subtitle").textContent = quiz.subtitle;
+    }).catch(function (e) {
+      fatal(e && e.message === "missing" ? "No quiz called “" + C.quizId + "” exists. Check quizId in config.js and run setup.sql." : QZ.reachMsg, true);
+      throw e;
+    });
+  }
+
+  function drawQR() {
+    var url = new URL("./", location.href).href;
+    $("url").textContent = url.replace(/\/$/, "/");
+    if (location.protocol === "file:") $("fileWarn").hidden = false;
+    try {
+      var qr = qrcode(0, "M"); qr.addData(url); qr.make();
+      $("qr").innerHTML = qr.createSvgTag({ cellSize: 8, scalable: true });
+    } catch (e) { $("qr").textContent = "QR code unavailable. Use the address below."; }
+  }
+
+  function renderQuestions() {
+    $("results").innerHTML = Q.map(function (item, qi) {
+      var rows = item.options.map(function (o, oi) {
+        return '<div class="row' + (oi === item.answer ? ' correct' : '') + '"><span class="l">' + L[oi] + '</span>' +
+          '<span class="t">' + esc(o) + '</span><span class="c" id="c' + qi + '_' + oi + '">0</span>' +
+          '<div class="bar"><div class="fill" id="f' + qi + '_' + oi + '"></div></div></div>';
+      }).join("");
+      return '<div class="q"><h3><span class="qn">' + (qi + 1) + '.</span>' + esc(item.q) +
+        '<span class="pct" id="p' + qi + '"></span></h3>' + rows + '</div>';
+    }).join("");
+    $("results").classList.toggle("revealed", revealed);
+  }
+
+  function render() {
+    var n = responses.length;
+    $("n").textContent = n; $("nlbl").textContent = n === 1 ? "response" : "responses";
+    Q.forEach(function (item, qi) {
+      var counts = item.options.map(function () { return 0; });
+      responses.forEach(function (r) { if (r.answers[qi] != null && counts[r.answers[qi]] != null) counts[r.answers[qi]]++; });
+      counts.forEach(function (c, oi) {
+        $("c" + qi + "_" + oi).textContent = c;
+        $("f" + qi + "_" + oi).style.width = (n ? 100 * c / n : 0) + "%";
+      });
+      $("p" + qi).textContent = n ? Math.round(100 * counts[item.answer] / n) + "% correct" : "";
+    });
+    var total = responses.reduce(function (s, r) { return s + r.score; }, 0);
+    $("avg").hidden = !revealed || !n;
+    $("avg").textContent = "Average score: " + (n ? Math.round(100 * total / n) / 100 : 0) + " out of " + Q.length;
+    $("closedNote").hidden = quiz.is_open;
+    $("openToggle").textContent = quiz.is_open ? "Close quiz" : "Reopen quiz";
+  }
+
+  function poll() {
+    db.from("quiz_quizzes").select("session_id,is_open").eq("quiz_id", C.quizId).single().then(function (r) {
+      if (r.error) throw r.error;
+      quiz.session_id = r.data.session_id; quiz.is_open = r.data.is_open;
+      return db.from("quiz_responses").select("name,answers,score,created_at").eq("session_id", quiz.session_id);
+    }).then(function (r) {
+      if (r.error) throw r.error;
+      responses = r.data; $("lost").hidden = true; render();
+    }).catch(function () { $("lost").textContent = QZ.reachMsg; $("lost").hidden = false; });
+  }
+
+  $("reveal").addEventListener("click", function () {
+    revealed = !revealed;
+    $("results").classList.toggle("revealed", revealed);
+    this.textContent = revealed ? "Hide answers" : "Show answers";
+    render();
+  });
+
+  $("csv").addEventListener("click", function () { QZ.csv(Q, QZ.studentRows(Q, responses)); });
+
+  $("openToggle").addEventListener("click", function () {
+    var btn = this, next = !quiz.is_open; btn.disabled = true;
+    db.rpc("quiz_set_open", { p_quiz: C.quizId, p_open: next }).then(function (r) {
+      btn.disabled = false; if (r.error) throw r.error; quiz.is_open = next; render();
+    }).catch(function () { btn.disabled = false; $("lost").textContent = QZ.reachMsg; $("lost").hidden = false; });
+  });
+
+  $("reset").addEventListener("click", function () {
+    if (!confirm("Start fresh for a new class? This screen will show 0 responses. Download the CSV first if you need it. (Earlier answers stay saved in Supabase.)")) return;
+    db.rpc("quiz_reset", { p_quiz: C.quizId }).then(function (r) {
+      if (r.error) throw r.error;
+      revealed = false; $("results").classList.remove("revealed"); $("reveal").textContent = "Show answers";
+      quiz.session_id = r.data; quiz.is_open = true; responses = []; render(); poll();
+    }).catch(function () { $("lost").textContent = QZ.reachMsg; $("lost").hidden = false; });
+  });
+})();
+</script>
+</body>
+</html>
